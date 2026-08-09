@@ -6,6 +6,7 @@ import streamlit as st
 import sqlite3
 import yfinance as yf
 import pandas as pd
+import requests
 from datetime import datetime, date
 import plotly.graph_objects as go
 import plotly.express as px
@@ -206,6 +207,13 @@ def init_db():
             moeda TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL UNIQUE,
+            adicionado_em TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -253,6 +261,47 @@ def deletar_todas_operacoes():
     conn.close()
 
 
+# ===== WATCHLIST =====
+def adicionar_watchlist(ticker):
+    """Adiciona ticker à watchlist. Retorna True se adicionou, False se já existia."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT INTO watchlist (ticker, adicionado_em) VALUES (?, ?)",
+            (ticker.upper().strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False  # já existe
+    finally:
+        conn.close()
+
+
+def remover_watchlist(ticker):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker.upper().strip(),))
+    conn.commit()
+    conn.close()
+
+
+def listar_watchlist():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT ticker, adicionado_em FROM watchlist ORDER BY adicionado_em DESC", conn)
+    conn.close()
+    return df
+
+
+def limpar_watchlist():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist")
+    conn.commit()
+    conn.close()
+
+
 def listar_tickers_ativos():
     """Retorna tickers únicos que têm operações."""
     conn = get_conn()
@@ -267,7 +316,7 @@ def listar_tickers_ativos():
 # ============================================================================
 # COTAÇÕES
 # ============================================================================
-@st.cache_data(ttl=900)  # cache de 15 min
+@st.cache_data(ttl=3600)  # cache de 15 min
 def cotacao_yahoo(ticker):
     """Pega cotação atual via Yahoo Finance."""
     try:
@@ -282,7 +331,41 @@ def cotacao_yahoo(ticker):
         return None
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=3600)
+def cotacao_rapida(ticker):
+    """Cotação completa pra tela de mercado: preço, variação, 52w high/low, nome, moeda."""
+    # Yahoo precisa de .SA pra tickers brasileiros (PETR4 → PETR4.SA)
+    ticker_yahoo = ticker
+    if any(c.isdigit() for c in ticker) and not ticker.startswith("^"):
+        # ticker brasileiro: termina em número, sem .SA nem ^
+        if not ticker.endswith(".SA"):
+            ticker_yahoo = ticker + ".SA"
+    try:
+        t = yf.Ticker(ticker_yahoo)
+        hist = t.history(period="1y")
+        if hist.empty or len(hist) < 2:
+            return None
+        preco = float(hist["Close"].iloc[-1])
+        preco_ontem = float(hist["Close"].iloc[-2])
+        variacao = ((preco / preco_ontem) - 1) * 100 if preco_ontem > 0 else 0
+        high_52w = float(hist["High"].max())
+        low_52w = float(hist["Low"].min())
+        moeda = t.info.get("currency", "USD")
+        nome_curto = t.info.get("shortName") or t.info.get("longName") or ticker
+        return {
+            "ticker": ticker,  # retorna o ticker original, n o com .SA
+            "nome": nome_curto,
+            "preco": preco,
+            "variacao_pct": variacao,
+            "52w_high": high_52w,
+            "52w_low": low_52w,
+            "moeda": moeda,
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
 def historico_yahoo(ticker, periodo="1y"):
     """Histórico de preços pra gráfico."""
     try:
@@ -994,6 +1077,26 @@ def pagina_backtest():
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+        # texto pra copiar e mandar pro TJRv2
+        texto_resumo = "📊 *Resultado Backtest Folia*\n\n"
+        for row in rows:
+            texto_resumo += (
+                f"• *{row['Carteira']}*\n"
+                f"  Valor final: {row['Valor Final']}\n"
+                f"  Aportado: {row['Total Aportado']}\n"
+                f"  Lucro: {row['Lucro']} ({row['Rentab. Total']})\n"
+                f"  CAGR: {row['CAGR (anual)']}\n"
+                f"  Drawdown: {row['Drawdown Máx.']}\n"
+                f"  Volatilidade: {row['Volatilidade']}\n\n"
+            )
+        texto_resumo += "_Manda esse texto pro @tjrv2bot e pede análise._"
+        st.text_area(
+            "📋 Copie e mande pro TJRv2",
+            value=texto_resumo,
+            height=250,
+            help="Clica no campo, dá Ctrl+A pra selecionar tudo, Ctrl+C pra copiar. Cola no Telegram pro @tjrv2bot.",
+        )
+
         # gráfico de evolução — valor absoluto
         fig = go.Figure()
         for nome, r in resultados.items():
@@ -1087,6 +1190,138 @@ def pagina_backtest():
 
 
 # ============================================================================
+# MERCADO — lista simples de ações
+# ============================================================================
+# benchmarks clássicos que sempre aparecem
+BENCHMARKS_MERCADO = [
+    ("PETR4", "Petrobras"),
+    ("VALE3", "Vale"),
+    ("ITUB4", "Itaú Unibanco"),
+    ("BBAS3", "Banco do Brasil"),
+    ("BBDC4", "Bradesco"),
+    ("ABEV3", "Ambev"),
+    ("WEGE3", "WEG"),
+    ("MGLU3", "Magazine Luiza"),
+    ("^BVSP", "IBOVESPA"),
+    ("^GSPC", "S&P 500"),
+    ("^IXIC", "NASDAQ"),
+    ("ESPO", "ETF Games (EUA)"),
+]
+
+
+def render_tabela_mercado(tickers_com_nomes, titulo=""):
+    """Renderiza tabela compacta de cotações."""
+    if titulo:
+        st.subheader(titulo)
+    rows = []
+    n = len(tickers_com_nomes)
+    progress = st.progress(0, text=f"Carregando 0/{n} tickers...")
+    for i, (ticker, _) in enumerate(tickers_com_nomes):
+        dados = cotacao_rapida(ticker)
+        if dados is None:
+            rows.append({"Ticker": ticker, "Nome": "—", "Preço": "—", "Var %": "—", "52w High": "—", "52w Low": "—"})
+        else:
+            emoji = "🟢" if dados["variacao_pct"] >= 0 else "🔴"
+            rows.append({
+                "Ticker": dados["ticker"],
+                "Nome": dados["nome"][:30] if dados["nome"] else "—",
+                "Preço": f"{dados['moeda']} {dados['preco']:.2f}",
+                "Var %": f"{emoji} {dados['variacao_pct']:+.2f}%",
+                "52w High": f"{dados['moeda']} {dados['52w_high']:.2f}",
+                "52w Low": f"{dados['moeda']} {dados['52w_low']:.2f}",
+            })
+        progress.progress((i + 1) / n, text=f"Carregando {i+1}/{n} tickers...")
+    progress.empty()
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sem dados pra mostrar.")
+
+
+def pagina_mercado(df_posicao):
+    """Página Mercado: watchlist + seus ativos + benchmarks + busca livre + IBOV."""
+    st.title("📈 Mercado")
+    st.caption(f"Atualizado em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    # ===== SEÇÃO 1: MERCADO AGORA (seus ativos + benchmarks) =====
+    st.subheader("� Mercado Agora")
+    tickers_usuario = []
+    if not df_posicao.empty:
+        tickers_usuario = [(r["Ticker"], r["Nome"]) for _, r in df_posicao.iterrows()]
+    tickers_mercado = list({t: n for t, n in (tickers_usuario + BENCHMARKS_MERCADO)}.items())
+    render_tabela_mercado(tickers_mercado)
+
+    # ===== SEÇÃO 2: WATCHLIST =====
+    st.divider()
+    st.subheader("⭐ Sua Watchlist")
+
+    col_add, col_clear = st.columns([3, 1])
+    with col_add:
+        novo_ticker = st.text_input("Adicionar ticker", placeholder="Ex: NTDOY, AAPL, PETR4", key="wl_add").upper().strip()
+    with col_clear:
+        st.write("")  # espaço pra alinhar
+        st.write("")
+        if st.button("🗑️ Limpar watchlist", key="wl_clear"):
+            limpar_watchlist()
+            st.rerun()
+
+    if st.button("➕ Adicionar", key="wl_btn_add"):
+        if novo_ticker:
+            if adicionar_watchlist(novo_ticker):
+                st.success(f"✅ {novo_ticker} adicionado à watchlist")
+                st.rerun()
+            else:
+                st.warning(f"⚠️ {novo_ticker} já tá na watchlist")
+
+    wl = listar_watchlist()
+    if wl.empty:
+        st.info("Watchlist vazia. Adicione tickers acima pra acompanhar.")
+    else:
+        tickers_wl = [(t, t) for t in wl["ticker"].tolist()]
+        render_tabela_mercado(tickers_wl)
+
+        # botão remover por ticker
+        with st.expander("🗑️ Remover da watchlist"):
+            ticker_remover = st.selectbox("Ticker pra remover", wl["ticker"].tolist(), key="wl_remove_sel")
+            if st.button("Remover", key="wl_btn_remove"):
+                remover_watchlist(ticker_remover)
+                st.success(f"✅ {ticker_remover} removido")
+                st.rerun()
+
+    # ===== SEÇÃO 3: PESQUISA LIVRE =====
+    st.divider()
+    st.subheader("🔍 Buscar Ação")
+    busca = st.text_input("Digite o ticker", placeholder="Ex: NTDOY, AAPL, VALE3", key="busca_mercado").upper().strip()
+    if busca:
+        dados = cotacao_rapida(busca)
+        if dados:
+            col1, col2, col3, col4 = st.columns(4)
+            emoji = "🟢" if dados["variacao_pct"] >= 0 else "🔴"
+            col1.metric("Preço", f"{dados['moeda']} {dados['preco']:.2f}")
+            col2.metric("Variação", f"{emoji} {dados['variacao_pct']:+.2f}%")
+            col3.metric("52w High", f"{dados['moeda']} {dados['52w_high']:.2f}")
+            col4.metric("52w Low", f"{dados['moeda']} {dados['52w_low']:.2f}")
+            st.caption(f"_{dados['nome']}_")
+        else:
+            st.error(f"❌ Não encontrei dados pra '{busca}'. Verifica o ticker.")
+
+    # ===== SEÇÃO 4: IBOV COMPLETO =====
+    st.divider()
+    with st.expander("🇧🇷 Lista dos 78 IBOV (principais via Yahoo Finance)"):
+        st.caption("Lista parcial dos constituintes do IBOVESPA. Adicione mais na watchlist.")
+        ibov_main = [
+            "PETR4", "VALE3", "ITUB4", "BBDC4", "BBAS3", "ABEV3",
+            "WEGE3", "MGLU3", "B3SA3", "SUZB3", "GGBR4", "CSAN3",
+            "JBSS3", "NATU3", "EQTL3", "CYRE3", "ELET3", "ELET6",
+            "RENT3", "HAPV3", "RDOR3", "PRIO3", "LREN3", "TOTS3",
+            "RAIZ4", "CSNA3", "PCAR3", "EMBR3", "AZUL4", "VIVT3",
+        ]
+        st.caption(f"Mostrando {len(ibov_main)} dos 78 (principais). Adicione os outros na watchlist.")
+        if st.button("📊 Ver cotação destes", key="ibov_view"):
+            render_tabela_mercado([(t, t) for t in ibov_main])
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 def main():
@@ -1097,7 +1332,7 @@ def main():
     # sidebar com navegação
     with st.sidebar:
         st.title("📊 Navegação")
-        pagina = st.radio("Ir pra", ["Dashboard", "Registrar Operação", "Histórico", "Evolução", "Backtest", "Simulador"])
+        pagina = st.radio("Ir pra", ["Dashboard", "Mercado", "Registrar Operação", "Histórico", "Evolução", "Backtest", "Simulador"])
         st.divider()
         if st.button("🔄 Atualizar cotações"):
             st.cache_data.clear()
@@ -1123,6 +1358,8 @@ def main():
     # roteia
     if pagina == "Dashboard":
         pagina_dashboard(df_posicao, cotacoes_ok)
+    elif pagina == "Mercado":
+        pagina_mercado(df_posicao)
     elif pagina == "Registrar Operação":
         pagina_registrar()
     elif pagina == "Histórico":
