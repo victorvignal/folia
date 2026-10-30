@@ -2,6 +2,7 @@
 Stack: Streamlit + SQLite + yfinance.
 Funcionalidades: registro de operacoes, dashboard com cotacao automatica, simulador.
 """
+import os
 import streamlit as st
 import sqlite3
 import yfinance as yf
@@ -14,7 +15,21 @@ import plotly.express as px
 # ============================================================================
 # CONFIG
 # ============================================================================
-DB_PATH = "folia.db"
+# Banco Supabase (compartilhado entre app local, app online e bot)
+SUPABASE_URL = "https://rayjujplldxfckwjcmdq.supabase.co"
+# lê credenciais do secrets do streamlit (online) ou fallback hardcoded (local)
+try:
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except Exception:
+    SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
+}
+
 SENHA_APP = "vimiar2705"  # mude depois se quiser
 TITULO_APP = "Folia — Investimentos"
 
@@ -184,133 +199,140 @@ st.markdown("""
 # ============================================================================
 # BANCO DE DADOS
 # ============================================================================
+# BANCO DE DADOS — Supabase (REST API)
+# ============================================================================
 def init_db():
-    """Cria tabelas se não existirem."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS operacoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT NOT NULL,
-            tipo TEXT NOT NULL CHECK(tipo IN ('C', 'V')),
-            ticker TEXT NOT NULL,
-            nome TEXT,
-            quantidade REAL NOT NULL,
-            preco_unitario REAL NOT NULL,
-            observacao TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS ativos (
-            ticker TEXT PRIMARY KEY,
-            nome TEXT,
-            moeda TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS watchlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT NOT NULL UNIQUE,
-            adicionado_em TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-
-def get_conn():
-    return sqlite3.connect(DB_PATH)
+    """No Supabase as tabelas são criadas via SQL Editor. Não faz nada aqui."""
+    pass
 
 
 def listar_operacoes():
-    conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT * FROM operacoes ORDER BY data DESC, id DESC",
-        conn,
+    """Lista todas as operações ordenadas por data DESC, id DESC."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/operacoes?order=data.desc,id.desc",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
     )
-    conn.close()
-    return df
+    if r.status_code != 200:
+        return pd.DataFrame()
+    data = r.json()
+    return pd.DataFrame(data)
 
 
 def inserir_operacao(data, tipo, ticker, nome, quantidade, preco_unitario, observacao=""):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO operacoes (data, tipo, ticker, nome, quantidade, preco_unitario, observacao)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (data, tipo, ticker.upper().strip(), nome, quantidade, preco_unitario, observacao))
-    # garante que ticker existe na tabela ativos
-    c.execute('INSERT OR IGNORE INTO ativos (ticker, nome) VALUES (?, ?)', (ticker.upper().strip(), nome))
-    conn.commit()
-    conn.close()
+    """Insere operação. Retorna True se sucesso."""
+    payload = {
+        "data": data,
+        "tipo": tipo,
+        "ticker": ticker.upper().strip(),
+        "nome": nome,
+        "quantidade": quantidade,
+        "preco_unitario": preco_unitario,
+        "observacao": observacao,
+    }
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/operacoes",
+        headers=SUPABASE_HEADERS,
+        json=payload,
+        timeout=10,
+    )
+    if r.status_code in (200, 201):
+        # garante ticker na tabela ativos
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/ativos",
+                headers=SUPABASE_HEADERS,
+                json={"ticker": ticker.upper().strip(), "nome": nome, "moeda": None},
+                timeout=5,
+            )
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def deletar_operacao(op_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM operacoes WHERE id = ?", (op_id,))
-    conn.commit()
-    conn.close()
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/operacoes?id=eq.{op_id}",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    return r.status_code in (200, 204)
 
 
 def deletar_todas_operacoes():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM operacoes")
-    conn.commit()
-    conn.close()
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/operacoes?id=gt.0",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    return r.status_code in (200, 204)
 
 
 # ===== WATCHLIST =====
 def adicionar_watchlist(ticker):
     """Adiciona ticker à watchlist. Retorna True se adicionou, False se já existia."""
-    conn = get_conn()
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT INTO watchlist (ticker, adicionado_em) VALUES (?, ?)",
-            (ticker.upper().strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False  # já existe
-    finally:
-        conn.close()
+    payload = {
+        "ticker": ticker.upper().strip(),
+        "adicionado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    # usa Prefer resolution=merge-duplicates pra retornar o existente ao invés de erro
+    headers_dup = dict(SUPABASE_HEADERS)
+    headers_dup["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/watchlist",
+        headers=headers_dup,
+        json=payload,
+        timeout=10,
+    )
+    return r.status_code in (200, 201)
 
 
 def remover_watchlist(ticker):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker.upper().strip(),))
-    conn.commit()
-    conn.close()
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/watchlist?ticker=eq.{ticker.upper().strip()}",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    return r.status_code in (200, 204)
 
 
 def listar_watchlist():
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT ticker, adicionado_em FROM watchlist ORDER BY adicionado_em DESC", conn)
-    conn.close()
-    return df
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/watchlist?order=adicionado_em.desc&select=ticker,adicionado_em",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    if r.status_code != 200:
+        return pd.DataFrame()
+    return pd.DataFrame(r.json())
 
 
 def limpar_watchlist():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM watchlist")
-    conn.commit()
-    conn.close()
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/watchlist?id=gt.0",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
+    )
+    return r.status_code in (200, 204)
 
 
 def listar_tickers_ativos():
     """Retorna tickers únicos que têm operações."""
-    conn = get_conn()
-    df = pd.read_sql_query(
-        "SELECT DISTINCT ticker, nome FROM operacoes",
-        conn,
+    # usa SELECT DISTINCT
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/operacoes?select=ticker,nome&order=ticker",
+        headers=SUPABASE_HEADERS,
+        timeout=10,
     )
-    conn.close()
-    return df
+    if r.status_code != 200:
+        return pd.DataFrame()
+    df = pd.DataFrame(r.json())
+    if df.empty:
+        return df
+    # dedup por ticker mantendo primeiro nome
+    df = df.drop_duplicates(subset=["ticker"], keep="first")
+    return df.reset_index(drop=True)
 
 
 # ============================================================================
@@ -402,39 +424,51 @@ def converter_para_brl(valor, moeda):
 # CÁLCULOS
 # ============================================================================
 def calcular_posicao(df_ops, cotacoes, cambio):
-    """Calcula posição consolidada por ticker."""
+    """Calcula posição consolidada por ticker. preco_unitario pode estar em USD (converte se necessário)."""
     if df_ops.empty:
         return pd.DataFrame()
     posicoes = []
     for ticker, grupo in df_ops.groupby("ticker"):
         nome = grupo["nome"].iloc[0] if "nome" in grupo.columns else ticker
         qtd_total = 0
-        custo_total = 0
+        custo_total_brl = 0
+        # detecta se o ticker é em USD (heurística: tem letras sem dígito, ou ^ no início)
+        is_dolar = ticker.startswith("^") or (
+            ticker.replace(".", "").replace("-", "").isalpha()
+        )
+        print(f"[DEBUG] ticker={ticker} is_dolar={is_dolar} cambio={cambio}")
         for _, op in grupo.iterrows():
             sinal = 1 if op["tipo"] == "C" else -1
             qtd_total += sinal * op["quantidade"]
-            custo_total += sinal * op["quantidade"] * op["preco_unitario"]
+            # converte preço unitário pra BRL se for USD
+            preco_op = op["preco_unitario"]
+            print(f"[DEBUG] op preco={preco_op} qtd={op['quantidade']}")
+            if is_dolar:
+                preco_op_brl = preco_op * cambio
+            else:
+                preco_op_brl = preco_op
+            custo_total_brl += sinal * op["quantidade"] * preco_op_brl
+            print(f"[DEBUG] custo parcial={custo_total_brl}")
         if qtd_total <= 0:
             continue
-        # cotação
+        # cotação atual
         if ticker in cotacoes:
             moeda = cotacoes[ticker].get("moeda", "BRL")
             preco_atual_brl = converter_para_brl(cotacoes[ticker]["preco"], moeda)
         else:
-            # fallback: assumir BRL se não conseguir cotação
-            preco_atual_brl = custo_total / qtd_total if qtd_total > 0 else 0
+            preco_atual_brl = custo_total_brl / qtd_total if qtd_total > 0 else 0
             moeda = "BRL"
-        preco_medio_brl = custo_total / qtd_total if qtd_total > 0 else 0
+        preco_medio_brl = custo_total_brl / qtd_total if qtd_total > 0 else 0
         valor_atual = qtd_total * preco_atual_brl
-        lucro = valor_atual - custo_total
-        rentab = (lucro / custo_total * 100) if custo_total > 0 else 0
+        lucro = valor_atual - custo_total_brl
+        rentab = (lucro / custo_total_brl * 100) if custo_total_brl > 0 else 0
         posicoes.append({
             "Ticker": ticker,
             "Nome": nome,
             "Quantidade": qtd_total,
             "Preço Médio (R$)": preco_medio_brl,
             "Preço Atual (R$)": preco_atual_brl,
-            "Custo Total (R$)": custo_total,
+            "Custo Total (R$)": custo_total_brl,
             "Valor Atual (R$)": valor_atual,
             "Lucro/Prejuízo (R$)": lucro,
             "Rentab. (%)": rentab,
@@ -1340,20 +1374,27 @@ def main():
         st.caption("Cache de cotações: 15min")
 
     # carrega dados
+    print(f"[MAIN] Lendo DB: {DB_PATH}")
     df_ops = listar_operacoes()
+    print(f"[MAIN] df_ops tem {len(df_ops)} operacoes")
     tickers_unicos = listar_tickers_ativos()
+    print(f"[MAIN] tickers_unicos: {list(tickers_unicos['ticker']) if not tickers_unicos.empty else 'vazio'}")
     cotacoes = {}
     cotacoes_ok = True
     if not tickers_unicos.empty:
         with st.spinner("Buscando cotações..."):
             for _, row in tickers_unicos.iterrows():
                 cot = cotacao_yahoo(row["ticker"])
+                print(f"[MAIN] cotacao {row['ticker']}: {cot}")
                 if cot:
                     cotacoes[row["ticker"]] = cot
                 else:
                     cotacoes_ok = False
 
-    df_posicao = calcular_posicao(df_ops, cotacoes, cambio_usd_brl())
+    cambio = cambio_usd_brl()
+    print(f"[MAIN] cambio USD/BRL: {cambio}")
+    df_posicao = calcular_posicao(df_ops, cotacoes, cambio)
+    print(f"[MAIN] df_posicao tem {len(df_posicao)} linhas")
 
     # roteia
     if pagina == "Dashboard":
